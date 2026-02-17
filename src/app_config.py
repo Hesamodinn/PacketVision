@@ -8,18 +8,12 @@ Goals:
 - Allow overriding defaults via config.json without breaking missing keys.
 - Detect headless mode automatically (no DISPLAY).
 - Compute common project paths (script_dir, captures folder, config path).
+- Provide dot-access config like: CFG.preview.w, CFG.ocr.max_dim, CFG.af.burst_count
 """
-import os, json
-from dataclasses import dataclass
-from typing import Any, Dict
-def deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
-    for k, v in (override or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = deep_update(out[k], v)
-        else:
-            out[k] = v
-    return out
+
+import os
+from omegaconf import OmegaConf
+
 
 DEFAULTS = {
     "preview": {"w": 1280, "h": 720, "fps": 30},
@@ -77,45 +71,48 @@ DEFAULTS = {
     },
 }
 
-@dataclass(frozen=True)
-class AppPaths:
-    script_dir: str
-    save_dir: str
-    config_path: str
 
-@dataclass(frozen=True)
-class AppConfig:
-    raw: Dict[str, Any]
-    paths: AppPaths
-    headless: bool
+def load(script_file: str, config_filename: str = "config.json"):
+    """
+    Returns an OmegaConf config with dot-access.
 
-    @staticmethod
-    def load(script_file: str, config_filename: str = "config.json") -> "AppConfig":
-        # headless detection
-        headless = not bool(os.environ.get("DISPLAY"))
+    Example:
+      CFG = load(__file__)
+      CFG.preview.w
+      CFG.ocr.max_dim
+      CFG.headless
+      CFG.paths.script_dir
+    """
+    headless = not bool(os.environ.get("DISPLAY"))
 
-        script_dir = os.path.dirname(os.path.abspath(script_file))
-        save_dir = os.path.join(script_dir, "captures")
-        os.makedirs(save_dir, exist_ok=True)
+    script_dir = os.path.dirname(os.path.abspath(script_file))
+    save_dir = os.path.join(script_dir, "captures")
+    os.makedirs(save_dir, exist_ok=True)
 
-        config_path = os.path.join(script_dir, config_filename)
+    config_path = os.path.join(script_dir, config_filename)
 
-        # load config override if exists
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                user_cfg = json.load(f)
-            merged = deep_update(DEFAULTS, user_cfg)
-        else:
-            merged = DEFAULTS
+    base = OmegaConf.create(DEFAULTS)
 
-        paths = AppPaths(script_dir=script_dir, save_dir=save_dir, config_path=config_path)
-        return AppConfig(raw=merged, paths=paths, headless=headless)
+    if os.path.exists(config_path):
+        override = OmegaConf.load(config_path)
+        cfg = OmegaConf.merge(base, override)
+    else:
+        cfg = base
 
-    # small helper getters (optional)
-    def get(self, *keys, default=None):
-        d = self.raw
+    # Add runtime fields (not from json)
+    cfg.headless = headless
+    cfg.paths.script_dir = script_dir
+    cfg.paths.save_dir = save_dir
+    cfg.paths.config_path = config_path
+
+    # Optional helper like your old get()
+    def _get(*keys, default=None):
+        cur = cfg
         for k in keys:
-            if not isinstance(d, dict) or k not in d:
+            if cur is None or k not in cur:
                 return default
-            d = d[k]
-        return d
+            cur = cur[k]
+        return cur
+
+    cfg.get = _get  # attach method dynamically
+    return cfg
