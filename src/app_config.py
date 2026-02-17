@@ -1,6 +1,3 @@
-import os, json
-from dataclasses import dataclass
-from typing import Any, Dict
 """
 app_config.py
 
@@ -12,6 +9,9 @@ Goals:
 - Detect headless mode automatically (no DISPLAY).
 - Compute common project paths (script_dir, captures folder, config path).
 """
+import os, json
+from dataclasses import dataclass
+from typing import Any, Dict
 def deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(base)
     for k, v in (override or {}).items():
