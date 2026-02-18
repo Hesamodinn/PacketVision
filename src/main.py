@@ -406,6 +406,7 @@ def _gemini_call_with_backoff(model, parts, generation_config, max_retries=4):
                 continue
             raise
 
+
 # =========================
 # Gemini OCR (returns ONLY ID)
 # =========================
@@ -423,7 +424,8 @@ def extract_id_from_packet(img_gray_or_bgr: np.ndarray) -> Tuple[Optional[str], 
       - "ERROR: <message>"
     """
 
-    api_key =CFG.api_key
+    # Recommended: keep your key in an env var instead of hardcoding
+    api_key = str(CFG.api_key)
     if not api_key:
         return None, "ERROR: GEMINI_API_KEY not set."
 
@@ -437,6 +439,14 @@ def extract_id_from_packet(img_gray_or_bgr: np.ndarray) -> Tuple[Optional[str], 
         gray = cv2.cvtColor(img_gray_or_bgr, cv2.COLOR_BGR2GRAY)
     else:
         gray = img_gray_or_bgr
+
+    # --- ADDED: RESIZE IMAGE TO SAVE TOKENS ---
+    # High-res images consume massive TPM (Tokens Per Minute).
+    # 1024px is a good sweet spot for OCR accuracy vs. token cost.
+    h, w = gray.shape[:2]
+    if max(h, w) > 1024:
+        scale = 1024 / max(h, w)
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
     payload_bytes, mime, used_q, used_gray = build_ocr_payload(gray)
     if payload_bytes is None:
@@ -465,58 +475,71 @@ Rules:
 - For tracking numbers: remove spaces and punctuation, keep letters/numbers only.
 """
 
-    try:
-        model = genai.GenerativeModel("gemini-2.0-flash-lite")
-        image_part = {"mime_type": mime, "data": payload_bytes}
-
-        resp = model.generate_content(
-            [prompt, image_part],
-            generation_config={"response_mime_type": "application/json"},
-        )
-
-        raw = (resp.text or "").strip()
-
-        # ---- Robust JSON parse (handles dict OR list) ----
+    # --- REPLACED: RETRY LOOP TO HANDLE 429 ERROR ---
+    max_retries = 3
+    raw = ""
+    for attempt in range(max_retries):
         try:
-            data = json.loads(raw)
-        except Exception:
-            m = re.search(r"\{.*\}|\[.*\]", raw, flags=re.DOTALL)
-            if not m:
-                return None, f"ERROR: Gemini returned non-JSON: {raw[:200]}"
-            data = json.loads(m.group(0))
+            model = genai.GenerativeModel("gemini-2.0-flash-lite")
+            image_part = {"mime_type": mime, "data": payload_bytes}
 
-        if isinstance(data, list):
-            data = next((x for x in data if isinstance(x, dict)), None)
-            if data is None:
-                return None, f"ERROR: Gemini returned JSON list but no object: {raw[:200]}"
+            resp = model.generate_content(
+                [prompt, image_part],
+                generation_config={"response_mime_type": "application/json"},
+            )
 
-        if not isinstance(data, dict):
-            return None, f"ERROR: Gemini returned unexpected JSON type: {type(data).__name__}"
+            raw = (resp.text or "").strip()
+            break  # success -> exit retry loop
 
-        found = bool(data.get("found", False))
-        if not found:
-            return None, "NOT_FOUND"
+        except google.api_core.exceptions.ResourceExhausted:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 10  # 10s, 20s, ...
+                print(f"[OCR 429] Quota hit. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            return None, f"ERROR: Quota exhausted after {max_retries} attempts."
+        except Exception as e:
+            return None, f"ERROR: {e}"
 
-        raw_id = data.get("id", None)
-        typ = str(data.get("type", "none")).strip()
+    # --- PROCEED WITH YOUR JSON PARSING (your original logic) ---
+    try:
+        data = json.loads(raw)
+    except Exception:
+        m = re.search(r"\{.*\}|\[.*\]", raw, flags=re.DOTALL)
+        if not m:
+            return None, f"ERROR: Gemini returned non-JSON: {raw[:200]}"
+        data = json.loads(m.group(0))
 
-        if raw_id is None:
-            return None, "NOT_FOUND"
+    if isinstance(data, list):
+        data = next((x for x in data if isinstance(x, dict)), None)
+        if data is None:
+            return None, f"ERROR: Gemini returned JSON list but no object: {raw[:200]}"
 
-        raw_id = str(raw_id).strip()
+    if not isinstance(data, dict):
+        return None, f"ERROR: Gemini returned unexpected JSON type: {type(data).__name__}"
 
-        if typ == "amazon_order_id":
-            clean_id = re.sub(r"[^0-9\-]", "", raw_id)
-        else:
-            clean_id = re.sub(r"[^A-Za-z0-9]", "", raw_id)
+    found = bool(data.get("found", False))
+    if not found:
+        return None, "NOT_FOUND"
 
-        if not clean_id:
-            return None, "NOT_FOUND"
+    raw_id = data.get("id", None)
+    typ = str(data.get("type", "none")).strip()
 
-        return clean_id, "OK"
+    if raw_id is None:
+        return None, "NOT_FOUND"
 
-    except Exception as e:
-        return None, f"ERROR: {e}"
+    raw_id = str(raw_id).strip()
+
+    if typ == "amazon_order_id":
+        clean_id = re.sub(r"[^0-9\-]", "", raw_id)
+    else:
+        clean_id = re.sub(r"[^A-Za-z0-9]", "", raw_id)
+
+    if not clean_id:
+        return None, "NOT_FOUND"
+
+    return clean_id, "OK"
+
 
 def make_ocr_input_gray(bgr: np.ndarray) -> np.ndarray:
     if bgr is None or getattr(bgr, "size", 0) == 0:
