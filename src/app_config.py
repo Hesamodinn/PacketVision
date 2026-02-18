@@ -117,7 +117,7 @@ class AppPaths:
     config_path: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) 
 class AppConfig:
     raw: DotDict
     runtime: AppPaths      # ✅ renamed from "paths"

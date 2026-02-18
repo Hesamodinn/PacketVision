@@ -49,7 +49,7 @@ from picamera2 import Picamera2
 from typing import Optional, Tuple
 import google.generativeai as genai
 import gspread
-from src.app_config import AppConfig
+from app_config import AppConfig
 ###
 #HEADLESS = not bool(os.environ.get("DISPLAY"))
 #print("[ENV] DISPLAY=", os.environ.get("DISPLAY"), "HEADLESS=", HEADLESS, flush=True)
@@ -58,90 +58,100 @@ from src.app_config import AppConfig
 
 
 
-CFG = load(__file__)  # defaults + config.json override + runtime paths
+CFG = AppConfig.load(__file__)  # defaults + config.json override + runtime paths
+
+from zoneinfo import ZoneInfo
+import os
+
+from app_config import AppConfig
+
+CFG = AppConfig.load(__file__)  # defaults + config.json override + runtime paths
 
 # --- runtime / env ---
 HEADLESS = CFG.headless
 print("[ENV] DISPLAY=", os.environ.get("DISPLAY"), "HEADLESS=", HEADLESS, flush=True)
 
-SCRIPT_DIR = CFG.paths.script_dir
-SAVE_DIR   = CFG.paths.save_dir
+SCRIPT_DIR = CFG.runtime.script_dir
+SAVE_DIR   = CFG.runtime.save_dir
+
 os.makedirs(SAVE_DIR, exist_ok=True)
+
 # --- preview (lores) ---
-PREVIEW_W  = CFG.preview.w
-PREVIEW_H  = CFG.preview.h
-TARGET_FPS = CFG.preview.fps
+PREVIEW_W  = int(CFG.preview.w)
+PREVIEW_H  = int(CFG.preview.h)
+TARGET_FPS = int(CFG.preview.fps)
 
 # --- capture (main) ---
-CAPTURE_W = CFG.capture.w
-CAPTURE_H = CFG.capture.h
+CAPTURE_W = int(CFG.capture.w)
+CAPTURE_H = int(CFG.capture.h)
 
 # --- fill color ---
 FILL_GREEN = tuple(CFG.fill_green_bgr)  # (0,255,0)
 
 # --- ROI trigger ---
-DIFF_THRESHOLD_PREVIEW_L  = CFG.roi_trigger.diff_threshold_l
-DIFF_THRESHOLD_PREVIEW_AB = CFG.roi_trigger.diff_threshold_ab
-ROI_RATIO_ON              = CFG.roi_trigger.roi_ratio_on
-ROI_RATIO_OFF             = CFG.roi_trigger.roi_ratio_off
-PRESENT_FRAMES_N          = CFG.roi_trigger.present_frames_n
-EMPTY_FRAMES_M            = CFG.roi_trigger.empty_frames_m
+DIFF_THRESHOLD_PREVIEW_L  = int(CFG.roi_trigger.diff_threshold_l)
+DIFF_THRESHOLD_PREVIEW_AB = int(CFG.roi_trigger.diff_threshold_ab)
+ROI_RATIO_ON              = float(CFG.roi_trigger.roi_ratio_on)
+ROI_RATIO_OFF             = float(CFG.roi_trigger.roi_ratio_off)
+PRESENT_FRAMES_N          = int(CFG.roi_trigger.present_frames_n)
+EMPTY_FRAMES_M            = int(CFG.roi_trigger.empty_frames_m)
 
 # --- countdown ---
-CAPTURE_COUNTDOWN_SEC = CFG.countdown_sec
+CAPTURE_COUNTDOWN_SEC = float(CFG.countdown_sec)
 
 # --- AF ---
-AF_FORCE_SINGLE_SHOT_BEFORE_CAPTURE = CFG.af.force_single_shot_before_capture
-AF_WAIT_TIMEOUT_SEC   = CFG.af.wait_timeout_sec
-AF_POLL_INTERVAL_SEC  = CFG.af.poll_interval_sec
-AF_SETTLE_SEC         = CFG.af.settle_sec
-CAPTURE_BURST_COUNT   = CFG.af.burst_count
-CAPTURE_BURST_GAP_SEC = CFG.af.burst_gap_sec
+AF_FORCE_SINGLE_SHOT_BEFORE_CAPTURE = bool(CFG.af.force_single_shot_before_capture)
+AF_WAIT_TIMEOUT_SEC   = float(CFG.af.wait_timeout_sec)
+AF_POLL_INTERVAL_SEC  = float(CFG.af.poll_interval_sec)
+AF_SETTLE_SEC         = float(CFG.af.settle_sec)
+CAPTURE_BURST_COUNT   = int(CFG.af.burst_count)
+CAPTURE_BURST_GAP_SEC = float(CFG.af.burst_gap_sec)
 
-REFOCUS_ON_COUNTDOWN_START         = CFG.af.refocus_on_countdown_start
-REFOCUS_EVERY_SEC_DURING_COUNTDOWN = CFG.af.refocus_every_sec_during_countdown
+REFOCUS_ON_COUNTDOWN_START         = bool(CFG.af.refocus_on_countdown_start)
+REFOCUS_EVERY_SEC_DURING_COUNTDOWN = float(CFG.af.refocus_every_sec_during_countdown)
 
-DISCARD_MAIN_FRAMES_AFTER_AF = CFG.af.discard_main_frames_after_af
-DISCARD_MAIN_FRAME_GAP_SEC   = CFG.af.discard_main_frame_gap_sec
+DISCARD_MAIN_FRAMES_AFTER_AF = int(CFG.af.discard_main_frames_after_af)
+DISCARD_MAIN_FRAME_GAP_SEC   = float(CFG.af.discard_main_frame_gap_sec)
 
-AF_CONTINUOUS_MODE          = CFG.af.continuous_mode
-LOCK_AE_AWB_AFTER_REFERENCE = CFG.af.lock_ae_awb_after_reference
+AF_CONTINUOUS_MODE          = bool(CFG.af.continuous_mode)
+LOCK_AE_AWB_AFTER_REFERENCE = bool(CFG.af.lock_ae_awb_after_reference)
 
 # --- debug ---
-SHOW_PREVIEW_DIFF = CFG.debug.show_preview_diff
-DEBUG_MAX_W       = CFG.debug.max_w
+SHOW_PREVIEW_DIFF = bool(CFG.debug.show_preview_diff)
+DEBUG_MAX_W       = int(CFG.debug.max_w)
 
 # --- red crop ---
-RED_WORK_MAX_DIM  = CFG.red_crop.work_max_dim
-RED_PAD_RATIO     = CFG.red_crop.pad_ratio
-TRIM_GREEN_BORDER = CFG.red_crop.trim_green_border
+RED_WORK_MAX_DIM  = int(CFG.red_crop.work_max_dim)
+RED_PAD_RATIO     = float(CFG.red_crop.pad_ratio)
+TRIM_GREEN_BORDER = bool(CFG.red_crop.trim_green_border)
 
 # --- OCR ---
-MIN_CROP_DIM_FOR_OCR       = CFG.ocr.min_crop_dim_for_ocr
-FULL_RES_UPSCALE_IF_SMALL  = CFG.ocr.full_res_upscale_if_small
+MIN_CROP_DIM_FOR_OCR      = int(CFG.ocr.min_crop_dim_for_ocr)
+FULL_RES_UPSCALE_IF_SMALL = int(CFG.ocr.full_res_upscale_if_small)
 
-OCR_MAX_DIM               = CFG.ocr.max_dim
-OCR_MAX_PIXELS            = CFG.ocr.max_pixels
-OCR_JPEG_TARGET_MAX_BYTES = CFG.ocr.jpeg_target_max_bytes
-OCR_JPEG_START_QUALITY    = CFG.ocr.jpeg_start_quality
-OCR_JPEG_MIN_QUALITY      = CFG.ocr.jpeg_min_quality
-SAVE_OCR_INPUT            = CFG.ocr.save_ocr_input
+OCR_MAX_DIM               = int(CFG.ocr.max_dim)
+OCR_MAX_PIXELS            = int(CFG.ocr.max_pixels)
+OCR_JPEG_TARGET_MAX_BYTES = int(CFG.ocr.jpeg_target_max_bytes)
+OCR_JPEG_START_QUALITY    = int(CFG.ocr.jpeg_start_quality)
+OCR_JPEG_MIN_QUALITY      = int(CFG.ocr.jpeg_min_quality)
+SAVE_OCR_INPUT            = bool(CFG.ocr.save_ocr_input)
 
-OCR_MIN_SECONDS_BETWEEN_CALLS = CFG.ocr.min_seconds_between_calls
-OCR_MAX_CALLS_PER_DAY         = CFG.ocr.max_calls_per_day
-RATE_STATE_PATH               = CFG.ocr.rate_state_path
-TZ                            = ZoneInfo(CFG.ocr.tz)
+OCR_MIN_SECONDS_BETWEEN_CALLS = float(CFG.ocr.min_seconds_between_calls)
+OCR_MAX_CALLS_PER_DAY         = int(CFG.ocr.max_calls_per_day)
+RATE_STATE_PATH               = str(CFG.ocr.rate_state_path)
+TZ                            = ZoneInfo(str(CFG.ocr.tz))
 
 # --- Google Sheets ---
-SERVICE_ACCOUNT_JSON = CFG.sheets.service_account_json
-SPREADSHEET_ID       = CFG.sheets.spreadsheet_id
-WORKSHEET_NAME       = CFG.sheets.worksheet_name
-DEFAULT_MACHINE      = CFG.sheets.default_machine
-DEFAULT_CONTENT      = CFG.sheets.default_content
+SERVICE_ACCOUNT_JSON = str(CFG.sheets.service_account_json)
+SPREADSHEET_ID       = str(CFG.sheets.spreadsheet_id)
+WORKSHEET_NAME       = str(CFG.sheets.worksheet_name)
+DEFAULT_MACHINE      = str(CFG.sheets.default_machine)
+DEFAULT_CONTENT      = str(CFG.sheets.default_content)
 
 # --- persisted paths ---
 ROI_STATE_PATH = CFG.paths.roi_state_path
-REF_LAB_PATH   = CFG.paths.ref_lab_path
+REF_LAB_PATH   = str(CFG.raw.paths.ref_lab_path)
+
 
 # =========================
 # ROI Picker (OpenCV)
