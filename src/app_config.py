@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 
 
 DEFAULTS = {
+    "api_key": "",
     "preview": {"w": 1280, "h": 720, "fps": 30},
     "capture": {"w": 2592, "h": 1944},
     "fill_green_bgr": [0, 255, 0],
