@@ -1,3 +1,4 @@
+
 """
 app_config.py
 
@@ -11,11 +12,40 @@ Goals:
 - Provide dot-access config like: CFG.preview.w, CFG.ocr.max_dim, CFG.af.burst_count
 """
 
+from __future__ import annotations
 import os
-from omegaconf import OmegaConf
+import json
+from dataclasses import dataclass
+from typing import Any, Dict
 
 
-DEFAULTS = {
+def deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_update(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+class DotDict(dict):
+    """dict with dot access (recursively)."""
+    def __getattr__(self, key):
+        try:
+            v = self[key]
+        except KeyError as e:
+            raise AttributeError(key) from e
+        if isinstance(v, dict) and not isinstance(v, DotDict):
+            v = DotDict(v)
+            self[key] = v
+        return v
+
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+
+DEFAULTS: Dict[str, Any] = {
     "api_key": "",
     "preview": {"w": 1280, "h": 720, "fps": 30},
     "capture": {"w": 2592, "h": 1944},
@@ -73,47 +103,58 @@ DEFAULTS = {
 }
 
 
-def load(script_file: str, config_filename: str = "config.json"):
-    """
-    Returns an OmegaConf config with dot-access.
+@dataclass(frozen=True)
+class AppPaths:
+    script_dir: str
+    save_dir: str
+    config_path: str
 
-    Example:
-      CFG = load(__file__)
-      CFG.preview.w
-      CFG.ocr.max_dim
-      CFG.headless
-      CFG.paths.script_dir
-    """
-    headless = not bool(os.environ.get("DISPLAY"))
 
-    script_dir = os.path.dirname(os.path.abspath(script_file))
-    save_dir = os.path.join(script_dir, "captures")
-    os.makedirs(save_dir, exist_ok=True)
+@dataclass(frozen=True)
+class AppPaths:
+    script_dir: str
+    save_dir: str
+    config_path: str
 
-    config_path = os.path.join(script_dir, config_filename)
 
-    base = OmegaConf.create(DEFAULTS)
+@dataclass(frozen=True)
+class AppConfig:
+    raw: DotDict
+    runtime: AppPaths      # ✅ renamed from "paths"
+    headless: bool
 
-    if os.path.exists(config_path):
-        override = OmegaConf.load(config_path)
-        cfg = OmegaConf.merge(base, override)
-    else:
-        cfg = base
+    # ✅ add this RIGHT HERE
+    def __getattr__(self, name: str):
+        # forward unknown attributes to raw config
+        return getattr(self.raw, name)
 
-    # Add runtime fields (not from json)
-    cfg.headless = headless
-    cfg.paths.script_dir = script_dir
-    cfg.paths.save_dir = save_dir
-    cfg.paths.config_path = config_path
+    @staticmethod
+    def load(script_file: str, config_filename: str = "config.json") -> "AppConfig":
+        headless = not bool(os.environ.get("DISPLAY"))
 
-    # Optional helper like your old get()
-    def _get(*keys, default=None):
-        cur = cfg
+        script_dir = os.path.dirname(os.path.abspath(script_file))
+        save_dir = os.path.join(script_dir, "captures")
+        os.makedirs(save_dir, exist_ok=True)
+
+        config_path = os.path.join(script_dir, config_filename)
+
+        merged = DEFAULTS
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                user_cfg = json.load(f)
+            merged = deep_update(DEFAULTS, user_cfg)
+
+        return AppConfig(
+            raw=DotDict(merged),
+            runtime=AppPaths(script_dir=script_dir, save_dir=save_dir, config_path=config_path),
+            headless=headless,
+        )
+
+    def get(self, *keys, default=None):
+        d: Any = self.raw
         for k in keys:
-            if cur is None or k not in cur:
+            if not isinstance(d, dict) or k not in d:
                 return default
-            cur = cur[k]
-        return cur
+            d = d[k]
+        return d
 
-    cfg.get = _get  # attach method dynamically
-    return cfg
