@@ -50,6 +50,11 @@ from typing import Optional, Tuple
 import google.generativeai as genai
 import gspread
 from app_config import AppConfig
+import threading
+from ui_bus import EventBus
+import google.api_core.exceptions
+
+
 ###
 #HEADLESS = not bool(os.environ.get("DISPLAY"))
 #print("[ENV] DISPLAY=", os.environ.get("DISPLAY"), "HEADLESS=", HEADLESS, flush=True)
@@ -442,10 +447,10 @@ def extract_id_from_packet(img_gray_or_bgr: np.ndarray) -> Tuple[Optional[str], 
 
     # --- ADDED: RESIZE IMAGE TO SAVE TOKENS ---
     # High-res images consume massive TPM (Tokens Per Minute).
-    # 1024px is a good sweet spot for OCR accuracy vs. token cost.
+    # 1600px is a good sweet spot for OCR accuracy vs. token cost.
     h, w = gray.shape[:2]
-    if max(h, w) > 1024:
-        scale = 1024 / max(h, w)
+    if max(h, w) > 1600:
+        scale = 1600 / max(h, w)
         gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
     payload_bytes, mime, used_q, used_gray = build_ocr_payload(gray)
@@ -1207,16 +1212,18 @@ def main():
                         last_text = "OCR input build failed."
                     else:
                         # Save the exact bytes we send (optional)
+                        ocr_input_gray, rot_k = best_text_orientation_gray(ocr_input_gray)
+
                         payload_bytes, mime, used_q, used_gray = build_ocr_payload(ocr_input_gray)
                         if payload_bytes is None:
                             last_text = "OCR payload build failed."
                         else:
-                            if SAVE_OCR_INPUT:
-                                ocr_input_path = os.path.join(SAVE_DIR, f"ocr_input_sent_{ts}.jpg")
-                                with open(ocr_input_path, "wb") as f:
-                                    f.write(payload_bytes)
-                                print("[OCR INPUT] saved:", ocr_input_path,
-                                      f"bytes={len(payload_bytes)} q={used_q} dim={used_gray.shape[1]}x{used_gray.shape[0]}")
+                            
+                            ocr_input_path = os.path.join(SAVE_DIR, f"ocr_input_sent_{ts}.jpg")
+                            with open(ocr_input_path, "wb") as f:
+                                f.write(payload_bytes)
+                            print("[OCR INPUT] saved:", ocr_input_path,
+                                    f"bytes={len(payload_bytes)} q={used_q} dim={used_gray.shape[1]}x{used_gray.shape[0]}")
 
                             label_path = os.path.join(SAVE_DIR, f"new_full_{ts}.txt")
                             H, W = new_full.shape[:2]
@@ -1382,6 +1389,306 @@ def main():
 
     cv2.destroyAllWindows()
     picam2.stop()
+def rotate_gray(img, k):
+    # k: 0,1,2,3 => 0°,90°,180°,270° clockwise
+    if k % 4 == 0: return img
+    if k % 4 == 1: return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if k % 4 == 2: return cv2.rotate(img, cv2.ROTATE_180)
+    return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
+def best_text_orientation_gray(gray: np.ndarray):
+    """
+    Cheap heuristic: pick rotation that maximizes horizontal text-like edges.
+    Returns (rotated_gray, k)
+    """
+    best_k = 0
+    best_score = -1.0
+
+    for k in (0, 1, 2, 3):
+        g = rotate_gray(gray, k)
+        g2 = cv2.GaussianBlur(g, (3, 3), 0)
+        edges = cv2.Canny(g2, 60, 180)
+        score = float(np.sum(edges))  # simple but works ok
+
+        if score > best_score:
+            best_score = score
+            best_k = k
+
+    return rotate_gray(gray, best_k), best_k
+
+def run_workflow(bus: "EventBus", stop_event: threading.Event):
+    """
+    Runs your existing logic but:
+    - no cv2.imshow / no cv2.waitKey
+    - emits preview/crop/log/step/result to CustomTkinter
+    - reacts to UI commands via bus events (optional)
+    """
+    global ROI
+
+    def log(level, msg):
+        bus.emit("log", level=level, msg=msg)
+
+    # commands coming from UI (toggle AF, recapture ref, change ROI)
+    pending_cmds = []
+
+    # helper: drain command events fast
+    def drain_commands():
+        while True:
+            try:
+                ev = bus.q.get_nowait()
+            except Exception:
+                break
+            if ev.type == "command":
+                pending_cmds.append(ev.data.get("name"))
+            else:
+                # not a command -> put back for UI thread
+                bus.q.put(ev)
+                break
+
+    try:
+        bus.emit("step", index=0, status="Idle / Waiting")
+        bus.emit("status", text="Initializing camera...")
+        picam2 = init_camera()
+        log("INFO", "Camera initialized")
+
+        af_enabled = AF_CONTINUOUS_MODE
+        ae_awb_locked = False
+        lock_values = None
+
+        # Try load saved ROI + reference
+        loaded = load_roi_and_reference()
+        if loaded:
+            rx, ry, rw, rh, ref_lab_preview = loaded
+            log("INFO", "Loaded saved ROI + reference. Skipping ROI picker.")
+        else:
+            # IMPORTANT:
+            # For best UX: implement ROI selection in Tk later.
+            # For now: force ROI to be pre-saved OR provide a simple fallback:
+            raise SystemExit("No saved ROI. Please run ROI selection setup first (we’ll move ROI picker into Tk next).")
+
+        # Trigger state
+        armed = True
+        occupied = False
+        present_count = 0
+        empty_count = 0
+        countdown_active = False
+        countdown_start = 0.0
+        last_text = ""
+
+        bus.emit("status", text="Running")
+        bus.emit("step", index=0, status="Running")
+
+        last_preview_push = 0.0
+
+        while not stop_event.is_set():
+            drain_commands()
+
+            # Handle commands
+            while pending_cmds:
+                cmd = pending_cmds.pop(0)
+                if cmd == "toggle_af":
+                    af_enabled = not af_enabled
+                    apply_controls(picam2, af_enabled=af_enabled, ae_awb_lock=ae_awb_locked, lock_values=lock_values)
+                    log("INFO", f"AF set to {af_enabled}")
+                elif cmd == "recapture_ref":
+                    log("INFO", "Recapturing reference...")
+                    # your existing 'r' logic but no imshow
+                    if af_enabled and AF_FORCE_SINGLE_SHOT_BEFORE_CAPTURE:
+                        af_single_shot_and_wait(picam2, AF_WAIT_TIMEOUT_SEC, AF_POLL_INTERVAL_SEC, AF_SETTLE_SEC)
+                        try: picam2.set_controls({"AfMode": 2})
+                        except Exception: pass
+                        discard_main_frames(picam2, DISCARD_MAIN_FRAMES_AFTER_AF, DISCARD_MAIN_FRAME_GAP_SEC)
+
+                    ref_full, ref_score = capture_main_best_frame(picam2, CAPTURE_BURST_COUNT, CAPTURE_BURST_GAP_SEC)
+                    rgb_ref_lores = picam2.capture_array("lores")
+                    ref_lores = cv2.cvtColor(rgb_ref_lores, cv2.COLOR_RGB2BGR)
+                    ref_lab_preview = make_ref_lab_preview(ref_lores[ry:ry + rh, rx:rx + rw].copy())
+                    save_roi_and_reference(rx, ry, rw, rh, ref_lab_preview)
+                    log("INFO", f"Reference updated (sharpness={ref_score:.1f})")
+                elif cmd == "change_roi":
+                    log("WARN", "Change ROI requested (not implemented in Tk yet).")
+                    clear_saved_roi_and_reference()
+                    raise SystemExit("ROI cleared. Implement ROI selection UI next.")
+
+            rgb = picam2.capture_array("lores")
+            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+            # push preview to UI at ~10 fps (avoid heavy UI load)
+            now = time.time()
+            if now - last_preview_push > 0.10:
+                # draw ROI rect in the preview image (for UX)
+                disp = frame.copy()
+                rect_color = (0, 255, 0) if armed else (0, 0, 255)
+                cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), rect_color, 2)
+                bus.emit("preview", bgr=disp)
+                last_preview_push = now
+
+            roi_now = frame[ry:ry + rh, rx:rx + rw]
+            ratio, diff_bin = roi_change_ratio_preview_shadow_suppressed(
+                roi_now, ref_lab_preview, DIFF_THRESHOLD_PREVIEW_L, DIFF_THRESHOLD_PREVIEW_AB
+            )
+
+            if not occupied:
+                occupied = ratio > ROI_RATIO_ON
+            else:
+                occupied = ratio > ROI_RATIO_OFF
+
+            if occupied:
+                present_count += 1
+                empty_count = 0
+            else:
+                empty_count += 1
+                present_count = 0
+
+            if (not countdown_active) and armed and present_count >= PRESENT_FRAMES_N:
+                countdown_active = True
+                countdown_start = time.time()
+                bus.emit("step", index=3, status="Countdown + AF (once)")
+                log("INFO", "Countdown started")
+
+                if af_enabled and REFOCUS_ON_COUNTDOWN_START:
+                    ok, focused = af_single_shot_and_wait(picam2, AF_WAIT_TIMEOUT_SEC, AF_POLL_INTERVAL_SEC, AF_SETTLE_SEC)
+                    try: picam2.set_controls({"AfMode": 2})
+                    except Exception: pass
+                    discard_main_frames(picam2, DISCARD_MAIN_FRAMES_AFTER_AF, DISCARD_MAIN_FRAME_GAP_SEC)
+                    log("INFO", f"AF start ok={ok} focused={focused}")
+
+            if countdown_active:
+                remaining = CAPTURE_COUNTDOWN_SEC - (time.time() - countdown_start)
+                bus.emit("status", text=f"Capture in {max(0.0, remaining):.1f}s")
+
+                if remaining <= 0:
+                    ts = int(time.time())
+                    bus.emit("step", index=4, status="Capture Burst (Best Frame)")
+                    log("INFO", "Capturing new full-res (best of burst)...")
+
+                    if af_enabled and AF_FORCE_SINGLE_SHOT_BEFORE_CAPTURE:
+                        ok, focused = af_single_shot_and_wait(picam2, AF_WAIT_TIMEOUT_SEC, AF_POLL_INTERVAL_SEC, AF_SETTLE_SEC)
+                        try: picam2.set_controls({"AfMode": 2})
+                        except Exception: pass
+                        discard_main_frames(picam2, DISCARD_MAIN_FRAMES_AFTER_AF, DISCARD_MAIN_FRAME_GAP_SEC)
+                        log("INFO", f"AF final ok={ok} focused={focused}")
+
+                    new_full, new_score = capture_main_best_frame(picam2, CAPTURE_BURST_COUNT, CAPTURE_BURST_GAP_SEC)
+                    new_path = os.path.join(SAVE_DIR, f"new_full_{ts}.jpg")
+                    cv2.imwrite(new_path, new_full)
+                    bus.emit("step", index=5, status="New Full-Res Image Saved")
+                    log("INFO", f"Saved {new_path} (sharpness={new_score:.1f})")
+
+                    bus.emit("step", index=6, status="Red Crop (Deskew)")
+                    crop_final, box_pts, bbox_xywh = crop_biggest_red_rotated_keep_full_rectangle(
+                        new_full, work_max_dim=RED_WORK_MAX_DIM, pad_ratio=RED_PAD_RATIO, trim=TRIM_GREEN_BORDER
+                    )
+
+                    if crop_final is None or crop_final.size == 0:
+                        log("ERROR", "Crop failed: no red contour")
+                        bus.emit("result", ocr="—", sheet="Crop failed")
+                    else:
+                        bus.emit("crop", bgr=crop_final)
+
+                        crop_for_ocr, bbox_override, did_recrop = upscale2x_and_recrop_if_small(new_full, crop_final)
+                        ocr_input_gray = make_ocr_input_gray(crop_for_ocr)
+
+                        if ocr_input_gray is None:
+                            log("ERROR", "OCR input build failed")
+                            bus.emit("result", ocr="—", sheet="OCR input failed")
+                        else:
+                            ocr_input_gray, rot_k = best_text_orientation_gray(ocr_input_gray)
+
+                            payload_bytes, mime, used_q, used_gray = build_ocr_payload(ocr_input_gray)
+                            if payload_bytes is None:
+                                log("ERROR", "OCR payload build failed")
+                                bus.emit("result", ocr="—", sheet="OCR payload failed")
+                            else:
+                                label_path = os.path.join(SAVE_DIR, f"new_full_{ts}.txt")
+                                H, W = new_full.shape[:2]
+                                save_yolo_bbox(label_path, W, H, bbox_override if bbox_override else bbox_xywh, cls_id=0)
+                                
+                                # --- SAVE the exact OCR image we send to Gemini (debug / audit) ---
+                                ocr_sent_path = os.path.join(SAVE_DIR, f"ocr_input_sent_{ts}.jpg")
+                                with open(ocr_sent_path, "wb") as f:
+                                    f.write(payload_bytes)
+                                log("INFO", f"OCR input saved: {ocr_sent_path} bytes={len(payload_bytes)} q={used_q} dim={used_gray.shape[1]}x{used_gray.shape[0]}")
+                                bus.emit("step", index=7, status="OCR (Gemini)")
+                                found_id, ocr_status = extract_id_from_packet(used_gray)
+
+                                if not found_id:
+                                    msg = "ID not found" if ocr_status == "NOT_FOUND" else ocr_status
+                                    log("WARN", f"OCR: {msg}")
+                                    bus.emit("result", ocr="NOT_FOUND", sheet=msg)
+                                else:
+                                    bus.emit("result", ocr=str(found_id), sheet="Updating sheet...")
+                                    bus.emit("step", index=8, status="Google Sheets Update")
+
+                                    found_id_db = normalize_id_for_db(found_id)
+                                    sheet_res = read_row_by_id_and_update_if_receipt(
+                                        spreadsheet_id=SPREADSHEET_ID,
+                                        worksheet_name=WORKSHEET_NAME,
+                                        id_value=found_id_db,
+                                        content=DEFAULT_CONTENT,
+                                        machine=DEFAULT_MACHINE,
+                                        id_col=1
+                                    )
+
+                                    if isinstance(sheet_res, dict) and sheet_res.get("found") is False:
+                                        # In pro UX: show dialog in main window later. For now keep your popup:
+                                        details = (
+                                            f"OCR ID: {found_id}\n\n"
+                                            "This ID does not exist in the sheet.\n"
+                                            "Are you sure the number is correct?"
+                                        )
+                                        user_yes = ask_yes_no("ID Not Found", details)
+                                        if user_yes:
+                                            added_res = add_row_if_user_confirms(
+                                                spreadsheet_id=SPREADSHEET_ID,
+                                                worksheet_name=WORKSHEET_NAME,
+                                                id_value_ui=str(found_id),
+                                                id_value_db=normalize_id_for_db(found_id_db),
+                                                content=DEFAULT_CONTENT,
+                                                machine=DEFAULT_MACHINE,
+                                                service_account_json=SERVICE_ACCOUNT_JSON,
+                                            )
+                                            sheet_msg = added_res.get("reason", str(added_res))
+                                        else:
+                                            sheet_msg = "Rejected by user"
+                                    else:
+                                        sheet_msg = sheet_res.get("reason", str(sheet_res)) if isinstance(sheet_res, dict) else str(sheet_res)
+
+                                    bus.emit("step", index=9, status="Result UI Message")
+                                    bus.emit("result", ocr=str(found_id), sheet=sheet_msg)
+                                    log("INFO", f"Result: ID={found_id} | {sheet_msg}")
+
+                    countdown_active = False
+                    armed = False
+
+            if (not countdown_active) and (not armed) and empty_count >= EMPTY_FRAMES_M:
+                armed = True
+                bus.emit("step", index=0, status="Re-armed / waiting")
+
+        # end while
+
+        picam2.stop()
+        bus.emit("stopped")
+
+    except Exception as e:
+        try:
+            bus.emit("log", level="ERROR", msg=str(e))
+            bus.emit("result", ocr="—", sheet=f"ERROR: {e}")
+            bus.emit("stopped")
+        except Exception:
+            pass
 if __name__ == "__main__":
-    main()
+    from ui_ctk import PacketVisionApp  # your CustomTkinter window class
+    from ui_bus import EventBus
+    import threading
+
+    bus = EventBus()
+    stop_event = threading.Event()
+
+    # start worker thread
+    t = threading.Thread(target=run_workflow, args=(bus, stop_event), daemon=True)
+    t.start()
+
+    # start GUI (main thread)
+    app = PacketVisionApp(bus, stop_event=stop_event)
+    app.mainloop()
