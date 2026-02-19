@@ -1594,7 +1594,10 @@ def run_workflow(bus: "EventBus", stop_event: threading.Event):
                             bus.emit("result", ocr="—", sheet="OCR input failed")
                         else:
                             ocr_input_gray, rot_k = best_text_orientation_gray(ocr_input_gray)
-
+                            # show the rotated OCR image in UI (convert gray -> BGR for display)
+                            bus.emit("crop", bgr=cv2.cvtColor(ocr_input_gray, cv2.COLOR_GRAY2BGR))
+                            log("INFO", f"OCR rotation k={rot_k} (0,1,2,3 => 0/90/180/270 clockwise)")
+                      
                             payload_bytes, mime, used_q, used_gray = build_ocr_payload(ocr_input_gray)
                             if payload_bytes is None:
                                 log("ERROR", "OCR payload build failed")
