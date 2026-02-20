@@ -449,8 +449,8 @@ def extract_id_from_packet(img_gray_or_bgr: np.ndarray) -> Tuple[Optional[str], 
     # High-res images consume massive TPM (Tokens Per Minute).
     # 1600px is a good sweet spot for OCR accuracy vs. token cost.
     h, w = gray.shape[:2]
-    if max(h, w) > 1600:
-        scale = 1600 / max(h, w)
+    if max(h, w) > 2048:
+        scale = 2048 / max(h, w)
         gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
     payload_bytes, mime, used_q, used_gray = build_ocr_payload(gray)

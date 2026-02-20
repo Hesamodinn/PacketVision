@@ -49,18 +49,23 @@ class PacketVisionApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("PacketVision — Workflow Viewer")
-        self.geometry("1280x760")
-
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()-90
+        self.geometry(f"{sw}x{sh}+0+0")
         # Main layout: left workspace + right steps (steps full height)
         self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=7)   # workspace
-        self.grid_columnconfigure(1, weight=3)   # steps
+        #self.grid_columnconfigure(0, weight=7)   # workspace
+        #self.grid_columnconfigure(1, weight=3)   # steps
+        self.grid_columnconfigure(0, weight=3)   # steps (left)
+        self.grid_columnconfigure(1, weight=7)   # workspace (right)
 
         # ======================
         # LEFT WORKSPACE
         # ======================
+        #workspace = ctk.CTkFrame(self, corner_radius=16)
+        #workspace.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         workspace = ctk.CTkFrame(self, corner_radius=16)
-        workspace.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        workspace.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
         workspace.grid_rowconfigure(1, weight=1)
         workspace.grid_columnconfigure(0, weight=3)  # preview column
         workspace.grid_columnconfigure(1, weight=2)  # crop column
@@ -159,8 +164,10 @@ class PacketVisionApp(ctk.CTk):
         # ======================
         # RIGHT: WORKFLOW STEPS (FULL HEIGHT)
         # ======================
+        #right = ctk.CTkFrame(self, corner_radius=16)
+        #right.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
         right = ctk.CTkFrame(self, corner_radius=16)
-        right.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
+        right.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(4, weight=1)  # steps scroll uses all height
 
