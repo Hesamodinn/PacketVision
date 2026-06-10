@@ -1,5 +1,6 @@
 # ui_ctk.py
 import threading
+import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageTk
 import numpy as np
@@ -21,23 +22,19 @@ STEPS = [
 ]
 
 def bgr_to_photoimage(bgr: np.ndarray, max_w: int, max_h: int):
-    """Convert BGR numpy image to Tk PhotoImage (keeps aspect ratio)."""
+    """Convert camera frame to CTkImage (keeps aspect ratio)."""
     if bgr is None or getattr(bgr, "size", 0) == 0:
         return None
 
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-
+    h, w = bgr.shape[:2]
     scale = min(max_w / float(w), max_h / float(h), 1.0)
     nw, nh = int(w * scale), int(h * scale)
     if nw < 2 or nh < 2:
         return None
 
-    if scale < 1.0:
-        rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
-
-    im = Image.fromarray(rgb)
-    return ImageTk.PhotoImage(im)
+    img = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA) if scale < 1.0 else bgr
+    im = Image.fromarray(img)
+    return ctk.CTkImage(light_image=im, dark_image=im, size=(nw, nh))
 
 class PacketVisionApp(ctk.CTk):
     def __init__(self, bus: EventBus, start_worker_fn):
@@ -120,8 +117,15 @@ class PacketVisionApp(ctk.CTk):
         self.light_dot.grid(row=0, column=1, sticky="e", padx=(8, 0))
         self.light_dot.grid_propagate(False)
 
-        self.preview_img_label = ctk.CTkLabel(preview_col, text="")
-        self.preview_img_label.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 8))
+        self.preview_canvas = tk.Canvas(preview_col, bg="#1c1c1c", highlightthickness=0)
+        self.preview_canvas.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 8))
+        self.preview_canvas.bind("<ButtonPress-1>",   self._on_roi_press)
+        self.preview_canvas.bind("<B1-Motion>",       self._on_roi_drag)
+        self.preview_canvas.bind("<ButtonRelease-1>", self._on_roi_release)
+        self._canvas_img_id  = None
+        self._canvas_tk_img  = None
+        self._canvas_rect_id = None
+        self._canvas_img_offset = (0, 0)
 
         # Logs (below preview, not full width)
         ctk.CTkLabel(
@@ -209,6 +213,15 @@ class PacketVisionApp(ctk.CTk):
         self.last_crop_photo = None
         self.current_step = 0
         self.stop_request = threading.Event()
+        self._last_bgr      = None
+        self._prev_scale    = 1.0
+        self._prev_frame_w  = 1280
+        self._prev_frame_h  = 720
+        self._prev_disp_w   = 0
+        self._prev_disp_h   = 0
+        self._roi_mode      = False
+        self._roi_start     = None
+        self._roi_end       = None
 
         # poll events
         self.after(50, self.poll_events)
@@ -280,6 +293,82 @@ class PacketVisionApp(ctk.CTk):
     def on_change_roi(self):
         self.bus.emit("command", name="change_roi")
 
+    def _draw_preview(self, bgr: np.ndarray):
+        cw = self.preview_canvas.winfo_width()
+        ch = self.preview_canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        h, w = bgr.shape[:2]
+        scale = min(cw / w, ch / h, 1.0)
+        nw, nh = int(w * scale), int(h * scale)
+        self._prev_scale   = scale
+        self._prev_frame_w, self._prev_frame_h = w, h
+        self._prev_disp_w,  self._prev_disp_h  = nw, nh
+        img = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+        pil_img = Image.fromarray(img)
+        tk_img  = ImageTk.PhotoImage(pil_img)
+        self._canvas_tk_img = tk_img
+        x0 = (cw - nw) // 2
+        y0 = (ch - nh) // 2
+        self._canvas_img_offset = (x0, y0)
+        if self._canvas_img_id is None:
+            self._canvas_img_id = self.preview_canvas.create_image(
+                x0, y0, anchor="nw", image=tk_img
+            )
+        else:
+            self.preview_canvas.itemconfig(self._canvas_img_id, image=tk_img)
+            self.preview_canvas.coords(self._canvas_img_id, x0, y0)
+
+    def _on_roi_press(self, event):
+        if not self._roi_mode:
+            return
+        self._roi_start = (event.x, event.y)
+        self._roi_end   = (event.x, event.y)
+        if self._canvas_rect_id is not None:
+            self.preview_canvas.delete(self._canvas_rect_id)
+        self._canvas_rect_id = self.preview_canvas.create_rectangle(
+            event.x, event.y, event.x, event.y,
+            outline="#00ff88", width=2
+        )
+
+    def _on_roi_drag(self, event):
+        if not self._roi_mode or self._roi_start is None:
+            return
+        self._roi_end = (event.x, event.y)
+        if self._canvas_rect_id is not None:
+            self.preview_canvas.coords(
+                self._canvas_rect_id,
+                self._roi_start[0], self._roi_start[1],
+                event.x, event.y
+            )
+
+    def _on_roi_release(self, event):
+        if not self._roi_mode or self._roi_start is None:
+            return
+        if self._canvas_rect_id is not None:
+            self.preview_canvas.delete(self._canvas_rect_id)
+            self._canvas_rect_id = None
+
+        ox, oy = self._canvas_img_offset
+        scale  = self._prev_scale
+        x1 = int((min(self._roi_start[0], event.x) - ox) / scale)
+        y1 = int((min(self._roi_start[1], event.y) - oy) / scale)
+        x2 = int((max(self._roi_start[0], event.x) - ox) / scale)
+        y2 = int((max(self._roi_start[1], event.y) - oy) / scale)
+        rw, rh = x2 - x1, y2 - y1
+
+        self._roi_mode  = False
+        self._roi_start = None
+
+        if rw > 10 and rh > 10:
+            self.log(f"[INFO] ROI set: x={x1} y={y1} w={rw} h={rh}")
+            self.status_label.configure(text="Status: ROI saved — starting detection")
+            self.bus.roi_queue.put((x1, y1, rw, rh))
+        else:
+            self.log("[WARN] Selection too small — click 'Change ROI' and try again")
+            self.status_label.configure(text="Status: ROI too small — try again")
+            self.bus.roi_queue.put(None)
+
     def on_close(self):
         self.stop_request.set()
         self.destroy()
@@ -308,10 +397,18 @@ class PacketVisionApp(ctk.CTk):
 
             elif t == "preview":
                 bgr = d.get("bgr", None)
-                photo = bgr_to_photoimage(bgr, max_w=880, max_h=560)
-                if photo is not None:
-                    self.last_preview_photo = photo
-                    self.preview_img_label.configure(image=photo)
+                self._last_bgr = bgr
+                if bgr is not None and not self._roi_mode:
+                    self._draw_preview(bgr)
+
+            elif t == "request_roi":
+                self._roi_mode  = True
+                self._roi_start = None
+                self._roi_end   = None
+                self.status_label.configure(
+                    text="Status: Drag on the live preview to select ROI, then release"
+                )
+                self.log("[INFO] Drag a rectangle on the live preview to select ROI")
 
             elif t == "crop":
                 bgr = d.get("bgr", None)
