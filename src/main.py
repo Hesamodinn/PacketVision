@@ -71,7 +71,10 @@ import os
 from app_config import AppConfig
 
 CFG = AppConfig.load(__file__)  # defaults + config.json override + runtime paths
-
+# --- AF sharpness gate (NEW) ---
+AF_MAX_TRIES       = int(getattr(CFG.af, "max_tries", 3))
+AF_LENS_SETTLE_SEC = float(getattr(CFG.af, "lens_settle_sec", 0.15))
+SHARP_MIN          = float(getattr(CFG.af, "sharp_min", 0.0))  # 0 = accept best (calibrate later)
 # --- runtime / env ---
 HEADLESS = CFG.headless
 print("[ENV] DISPLAY=", os.environ.get("DISPLAY"), "HEADLESS=", HEADLESS, flush=True)
@@ -554,6 +557,46 @@ def make_ocr_input_gray(bgr: np.ndarray) -> np.ndarray:
 # =========================
 # Trigger helpers (lores ROI) - shadow suppressed
 # =========================
+def run_autofocus(picam2, timeout_sec=AF_WAIT_TIMEOUT_SEC):
+    """Blocking single-shot AF. Returns True if focus achieved."""
+    try:
+        return bool(picam2.autofocus_cycle())          # preferred: handles mode + trigger
+    except Exception:
+        pass
+    # Fallback: manual trigger, break on Focused(2) OR Failed(3)
+    try:
+        picam2.set_controls({"AfMode": 1, "AfTrigger": 0})   # Auto + Start
+    except Exception:
+        return False
+    t0 = time.time()
+    while time.time() - t0 < timeout_sec:
+        try:
+            s = picam2.capture_metadata().get("AfState", None)
+            if s == 2: return True      # Focused
+            if s == 3: return False     # Failed
+        except Exception:
+            pass
+        time.sleep(AF_POLL_INTERVAL_SEC)
+    return False
+
+
+def capture_focused_sharp(picam2, tries=AF_MAX_TRIES, burst=CAPTURE_BURST_COUNT,
+                          gap=CAPTURE_BURST_GAP_SEC, min_sharp=SHARP_MIN):
+    """Focus (blocking) -> best-of-burst -> retry if below sharpness floor.
+    Returns (best_bgr, best_score, ok)."""
+    best, best_score, ok = None, -1.0, False
+    for attempt in range(1, int(tries) + 1):
+        af_ok = run_autofocus(picam2)
+        time.sleep(AF_LENS_SETTLE_SEC)                 # let the lens physically settle
+        discard_main_frames(picam2, DISCARD_MAIN_FRAMES_AFTER_AF, DISCARD_MAIN_FRAME_GAP_SEC)
+        frame, score = capture_main_best_frame(picam2, burst, gap)
+        print(f"[AF] try {attempt}/{tries} af_ok={af_ok} sharpness={score:.0f} (min={min_sharp:.0f})")
+        if score > best_score:
+            best, best_score = frame, score
+        if af_ok and score >= min_sharp:
+            ok = True
+            break
+    return best, best_score, ok
 def make_ref_lab_preview(roi_bgr):
     lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
     lab = cv2.GaussianBlur(lab, (5, 5), 0)
@@ -645,10 +688,9 @@ def af_single_shot_and_wait(picam2, timeout_sec=3.0, poll_sec=0.05, settle_sec=0
     ok_trigger = False
 
     for c in (
-        {"AfMode": 1, "AfTrigger": 1},
         {"AfMode": 1, "AfTrigger": 0},
         {"AfMode": 1},
-        {"AfTrigger": 1},
+        {"AfTrigger": 0},
     ):
         try:
             picam2.set_controls(c)
@@ -1167,23 +1209,17 @@ def main():
             if remaining <= 0:
                 show_loading(frame, rx, ry, rw, rh, "CAPTURING / OCR... PLEASE WAIT")
                 ts = int(time.time())
-                print("[NEW] Capturing FULL-RES new image (AF wait + best-of-burst)...")
+                print("[NEW] Capturing FULL-RES new image (focus -> sharp -> retry)...")
 
-                if af_enabled and AF_FORCE_SINGLE_SHOT_BEFORE_CAPTURE:
-                    ok, focused = af_single_shot_and_wait(
-                        picam2,
-                        timeout_sec=AF_WAIT_TIMEOUT_SEC,
-                        poll_sec=AF_POLL_INTERVAL_SEC,
-                        settle_sec=AF_SETTLE_SEC
-                    )
-                    try:
-                        picam2.set_controls({"AfMode": 2})
-                    except Exception:
-                        pass
-                    discard_main_frames(picam2, DISCARD_MAIN_FRAMES_AFTER_AF, DISCARD_MAIN_FRAME_GAP_SEC)
-                    last_text = f"AF final ok={ok} focused={focused}"
+                new_full, new_score, focus_ok = capture_focused_sharp(picam2)
+                last_text = f"AF focus_ok={focus_ok} sharp={new_score:.0f}"
 
-                new_full, new_score = capture_main_best_frame(picam2, CAPTURE_BURST_COUNT, CAPTURE_BURST_GAP_SEC)
+                if (new_full is None) or (SHARP_MIN > 0 and not focus_ok):
+                    print(f"[AF] Too blurry / no focus (sharp={new_score:.0f}) -> skipped.")
+                    last_text = f"Too blurry (sharp={new_score:.0f}) -> skipped"
+                    countdown_active = False
+                    armed = False
+                    continue
 
                 new_path = os.path.join(SAVE_DIR, f"new_full_{ts}.jpg")
                 cv2.imwrite(new_path, new_full)
@@ -1461,19 +1497,66 @@ def run_workflow(bus: "EventBus", stop_event: threading.Event):
             rx, ry, rw, rh, ref_lab_preview = loaded
             log("INFO", "Loaded saved ROI + reference. Skipping ROI picker.")
         else:
-            # IMPORTANT:
-            # For best UX: implement ROI selection in Tk later.
-            # For now: force ROI to be pre-saved OR provide a simple fallback:
-            raise SystemExit("No saved ROI. Please run ROI selection setup first (we’ll move ROI picker into Tk next).")
+            log("WARN", "No saved ROI. Click ‘Change ROI’ to select one.")
+            bus.emit("status", text="No ROI — click ‘Change ROI’ to select")
+            last_preview_push_noroi = 0.0
+            while not stop_event.is_set():
+                drain_commands()
+                if "change_roi" in pending_cmds:
+                    pending_cmds.remove("change_roi")
+                    bus.emit("request_roi")
+                    try:
+                        coords = bus.roi_queue.get(timeout=60)
+                    except Exception:
+                        coords = None
+                    if coords is not None:
+                        rx_s, ry_s, rw_s, rh_s = coords
+                        rx_s, ry_s, rw_s, rh_s = clamp_roi(
+                            (rx_s, ry_s, rw_s, rh_s), PREVIEW_W, PREVIEW_H
+                        )
+                        rgb_ref = picam2.capture_array("lores")
+                        ref_lores_img = cv2.cvtColor(rgb_ref, cv2.COLOR_RGB2BGR)
+                        ref_lab_preview = make_ref_lab_preview(
+                            ref_lores_img[ry_s:ry_s+rh_s, rx_s:rx_s+rw_s].copy()
+                        )
+                        save_roi_and_reference(rx_s, ry_s, rw_s, rh_s, ref_lab_preview)
+                        rx, ry, rw, rh = rx_s, ry_s, rw_s, rh_s
+                        log("INFO", f"ROI saved: {rx},{ry},{rw},{rh}")
+                        loaded = True
+                        break
+                    else:
+                        log("WARN", "ROI selection cancelled or too small — try again.")
+                now = time.time()
+                if now - last_preview_push_noroi > 0.10:
+                    rgb_prev = picam2.capture_array("lores")
+                    frame_prev = cv2.cvtColor(rgb_prev, cv2.COLOR_RGB2BGR)
+                    cv2.putText(frame_prev,
+                                "No ROI — click ‘Change ROI’ to select",
+                                (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 80, 255), 2)
+                    bus.emit("preview", bgr=frame_prev)
+                    last_preview_push_noroi = now
+                time.sleep(0.02)
+            if stop_event.is_set() or not loaded:
+                picam2.stop()
+                bus.emit("stopped")
+                return
 
         # Trigger state
-        armed = True
-        occupied = False
+        armed        = True
+        occupied     = False
         present_count = 0
-        empty_count = 0
-        countdown_active = False
-        countdown_start = 0.0
+        empty_count   = 0
+        monitoring_active = False   # object detected, waiting for stability
         last_text = ""
+
+        # stability gate — tune these two values if needed
+        STABLE_THRESH = 4.0   # max mean pixel diff (0-255) to call a frame stable
+        STABLE_NEEDED = 10    # consecutive stable frames required (~1 s at 10 fps)
+        STABLE_TIMEOUT = 20.0 # safety: force capture after this many seconds even if not stable
+
+        _last_roi_gray  = None
+        _stable_count   = 0
+        _monitoring_start = 0.0
 
         bus.emit("status", text="Running")
         bus.emit("step", index=0, status="Running")
@@ -1506,9 +1589,33 @@ def run_workflow(bus: "EventBus", stop_event: threading.Event):
                     save_roi_and_reference(rx, ry, rw, rh, ref_lab_preview)
                     log("INFO", f"Reference updated (sharpness={ref_score:.1f})")
                 elif cmd == "change_roi":
-                    log("WARN", "Change ROI requested (not implemented in Tk yet).")
                     clear_saved_roi_and_reference()
-                    raise SystemExit("ROI cleared. Implement ROI selection UI next.")
+                    bus.emit("request_roi")
+                    try:
+                        coords = bus.roi_queue.get(timeout=60)
+                    except Exception:
+                        coords = None
+                    if coords is not None:
+                        rx_s, ry_s, rw_s, rh_s = coords
+                        rx_s, ry_s, rw_s, rh_s = clamp_roi(
+                            (rx_s, ry_s, rw_s, rh_s), PREVIEW_W, PREVIEW_H
+                        )
+                        rgb_ref = picam2.capture_array("lores")
+                        ref_lores_img = cv2.cvtColor(rgb_ref, cv2.COLOR_RGB2BGR)
+                        ref_lab_preview = make_ref_lab_preview(
+                            ref_lores_img[ry_s:ry_s+rh_s, rx_s:rx_s+rw_s].copy()
+                        )
+                        save_roi_and_reference(rx_s, ry_s, rw_s, rh_s, ref_lab_preview)
+                        rx, ry, rw, rh = rx_s, ry_s, rw_s, rh_s
+                        armed = True
+                        occupied = False
+                        present_count = 0
+                        empty_count = 0
+                        countdown_active = False
+                        log("INFO", f"ROI updated: {rx},{ry},{rw},{rh}")
+                        bus.emit("status", text="ROI updated — running")
+                    else:
+                        log("WARN", "ROI selection cancelled — keeping previous ROI.")
 
             rgb = picam2.capture_array("lores")
             frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -1540,36 +1647,66 @@ def run_workflow(bus: "EventBus", stop_event: threading.Event):
                 empty_count += 1
                 present_count = 0
 
-            if (not countdown_active) and armed and present_count >= PRESENT_FRAMES_N:
-                countdown_active = True
-                countdown_start = time.time()
-                bus.emit("step", index=3, status="Countdown + AF (once)")
-                log("INFO", "Countdown started")
+            # ── Start monitoring when object first appears ──────────────────────
+            if (not monitoring_active) and armed and present_count >= PRESENT_FRAMES_N:
+                monitoring_active  = True
+                _monitoring_start  = time.time()
+                _last_roi_gray     = None
+                _stable_count      = 0
+                bus.emit("step", index=3, status="Object detected — waiting for hand to leave...")
+                log("INFO", "Object detected — monitoring stability")
 
-                if af_enabled and REFOCUS_ON_COUNTDOWN_START:
-                    ok, focused = af_single_shot_and_wait(picam2, AF_WAIT_TIMEOUT_SEC, AF_POLL_INTERVAL_SEC, AF_SETTLE_SEC)
-                    try: picam2.set_controls({"AfMode": 2})
-                    except Exception: pass
-                    discard_main_frames(picam2, DISCARD_MAIN_FRAMES_AFTER_AF, DISCARD_MAIN_FRAME_GAP_SEC)
-                    log("INFO", f"AF start ok={ok} focused={focused}")
+            # ── If object leaves ROI while monitoring, abort and re-arm ─────────
+            if monitoring_active and empty_count >= EMPTY_FRAMES_M:
+                monitoring_active = False
+                _stable_count     = 0
+                _last_roi_gray    = None
+                armed = True
+                bus.emit("step", index=0, status="Re-armed / waiting")
+                log("INFO", "Object left ROI — re-arming")
 
-            if countdown_active:
-                remaining = CAPTURE_COUNTDOWN_SEC - (time.time() - countdown_start)
-                bus.emit("status", text=f"Capture in {max(0.0, remaining):.1f}s")
+            # ── Stability gate ────────────────────────────────────────────────
+            if monitoring_active:
+                # measure motion inside (and slightly around) the ROI
+                H_f, W_f = frame.shape[:2]
+                mx = rw // 3;  my = rh // 3
+                x0s = max(0, rx - mx);  y0s = max(0, ry - my)
+                x1s = min(W_f, rx + rw + mx);  y1s = min(H_f, ry + rh + my)
+                roi_region = frame[y0s:y1s, x0s:x1s]
+                gray_now   = cv2.cvtColor(roi_region, cv2.COLOR_BGR2GRAY)
 
-                if remaining <= 0:
+                diff_mean = 0.0
+                if _last_roi_gray is not None and _last_roi_gray.shape == gray_now.shape:
+                    diff_mean = float(cv2.absdiff(gray_now, _last_roi_gray).mean())
+                    _stable_count = _stable_count + 1 if diff_mean < STABLE_THRESH else 0
+                _last_roi_gray = gray_now
+
+                elapsed   = time.time() - _monitoring_start
+                is_stable = _stable_count >= STABLE_NEEDED
+                timed_out = elapsed > STABLE_TIMEOUT
+
+                bus.emit("status", text=(
+                    "Scene stable — focusing & capturing..." if is_stable else
+                    f"Hold still... motion={diff_mean:.1f}  stable={_stable_count}/{STABLE_NEEDED}"
+                ))
+
+                if is_stable or timed_out:
+                    monitoring_active = False
+                    _last_roi_gray    = None
+                    if timed_out and not is_stable:
+                        log("WARN", f"Stability timeout after {elapsed:.1f}s — capturing anyway")
                     ts = int(time.time())
                     bus.emit("step", index=4, status="Capture Burst (Best Frame)")
                     log("INFO", "Capturing new full-res (best of burst)...")
 
-                    if af_enabled and AF_FORCE_SINGLE_SHOT_BEFORE_CAPTURE:
-                        ok, focused = af_single_shot_and_wait(picam2, AF_WAIT_TIMEOUT_SEC, AF_POLL_INTERVAL_SEC, AF_SETTLE_SEC)
-                        try: picam2.set_controls({"AfMode": 2})
-                        except Exception: pass
-                        discard_main_frames(picam2, DISCARD_MAIN_FRAMES_AFTER_AF, DISCARD_MAIN_FRAME_GAP_SEC)
-                        log("INFO", f"AF final ok={ok} focused={focused}")
+                    new_full, new_score, focus_ok = capture_focused_sharp(picam2)
+                    log("INFO", f"AF focus_ok={focus_ok} sharp={new_score:.0f}")
 
-                    new_full, new_score = capture_main_best_frame(picam2, CAPTURE_BURST_COUNT, CAPTURE_BURST_GAP_SEC)
+                    if (new_full is None) or (SHARP_MIN > 0 and not focus_ok):
+                        log("WARN", f"Too blurry (sharp={new_score:.0f}) -> skipped")
+                        armed = False
+                        continue
+
                     new_path = os.path.join(SAVE_DIR, f"new_full_{ts}.jpg")
                     cv2.imwrite(new_path, new_full)
                     bus.emit("step", index=5, status="New Full-Res Image Saved")
@@ -1585,86 +1722,12 @@ def run_workflow(bus: "EventBus", stop_event: threading.Event):
                         bus.emit("result", ocr="—", sheet="Crop failed")
                     else:
                         bus.emit("crop", bgr=crop_final)
+                        log("INFO", f"[TEST MODE] Crop done — sharp={new_score:.0f}. OCR + Sheets skipped.")
+                        bus.emit("result", ocr="(test mode)", sheet="OCR + Sheets disabled")
 
-                        crop_for_ocr, bbox_override, did_recrop = upscale2x_and_recrop_if_small(new_full, crop_final)
-                        ocr_input_gray = make_ocr_input_gray(crop_for_ocr)
-
-                        if ocr_input_gray is None:
-                            log("ERROR", "OCR input build failed")
-                            bus.emit("result", ocr="—", sheet="OCR input failed")
-                        else:
-                            ocr_input_gray, rot_k = best_text_orientation_gray(ocr_input_gray)
-                            # show the rotated OCR image in UI (convert gray -> BGR for display)
-                            bus.emit("crop", bgr=cv2.cvtColor(ocr_input_gray, cv2.COLOR_GRAY2BGR))
-                            log("INFO", f"OCR rotation k={rot_k} (0,1,2,3 => 0/90/180/270 clockwise)")
-                      
-                            payload_bytes, mime, used_q, used_gray = build_ocr_payload(ocr_input_gray)
-                            if payload_bytes is None:
-                                log("ERROR", "OCR payload build failed")
-                                bus.emit("result", ocr="—", sheet="OCR payload failed")
-                            else:
-                                label_path = os.path.join(SAVE_DIR, f"new_full_{ts}.txt")
-                                H, W = new_full.shape[:2]
-                                save_yolo_bbox(label_path, W, H, bbox_override if bbox_override else bbox_xywh, cls_id=0)
-                                
-                                # --- SAVE the exact OCR image we send to Gemini (debug / audit) ---
-                                ocr_sent_path = os.path.join(SAVE_DIR, f"ocr_input_sent_{ts}.jpg")
-                                with open(ocr_sent_path, "wb") as f:
-                                    f.write(payload_bytes)
-                                log("INFO", f"OCR input saved: {ocr_sent_path} bytes={len(payload_bytes)} q={used_q} dim={used_gray.shape[1]}x{used_gray.shape[0]}")
-                                bus.emit("step", index=7, status="OCR (Gemini)")
-                                found_id, ocr_status = extract_id_from_packet(used_gray)
-
-                                if not found_id:
-                                    msg = "ID not found" if ocr_status == "NOT_FOUND" else ocr_status
-                                    log("WARN", f"OCR: {msg}")
-                                    bus.emit("result", ocr="NOT_FOUND", sheet=msg)
-                                else:
-                                    bus.emit("result", ocr=str(found_id), sheet="Updating sheet...")
-                                    bus.emit("step", index=8, status="Google Sheets Update")
-
-                                    found_id_db = normalize_id_for_db(found_id)
-                                    sheet_res = read_row_by_id_and_update_if_receipt(
-                                        spreadsheet_id=SPREADSHEET_ID,
-                                        worksheet_name=WORKSHEET_NAME,
-                                        id_value=found_id_db,
-                                        content=DEFAULT_CONTENT,
-                                        machine=DEFAULT_MACHINE,
-                                        id_col=1
-                                    )
-
-                                    if isinstance(sheet_res, dict) and sheet_res.get("found") is False:
-                                        # In pro UX: show dialog in main window later. For now keep your popup:
-                                        details = (
-                                            f"OCR ID: {found_id}\n\n"
-                                            "This ID does not exist in the sheet.\n"
-                                            "Are you sure the number is correct?"
-                                        )
-                                        user_yes = ask_yes_no("ID Not Found", details)
-                                        if user_yes:
-                                            added_res = add_row_if_user_confirms(
-                                                spreadsheet_id=SPREADSHEET_ID,
-                                                worksheet_name=WORKSHEET_NAME,
-                                                id_value_ui=str(found_id),
-                                                id_value_db=normalize_id_for_db(found_id_db),
-                                                content=DEFAULT_CONTENT,
-                                                machine=DEFAULT_MACHINE,
-                                                service_account_json=SERVICE_ACCOUNT_JSON,
-                                            )
-                                            sheet_msg = added_res.get("reason", str(added_res))
-                                        else:
-                                            sheet_msg = "Rejected by user"
-                                    else:
-                                        sheet_msg = sheet_res.get("reason", str(sheet_res)) if isinstance(sheet_res, dict) else str(sheet_res)
-
-                                    bus.emit("step", index=9, status="Result UI Message")
-                                    bus.emit("result", ocr=str(found_id), sheet=sheet_msg)
-                                    log("INFO", f"Result: ID={found_id} | {sheet_msg}")
-
-                    countdown_active = False
                     armed = False
 
-            if (not countdown_active) and (not armed) and empty_count >= EMPTY_FRAMES_M:
+            if (not monitoring_active) and (not armed) and empty_count >= EMPTY_FRAMES_M:
                 armed = True
                 bus.emit("step", index=0, status="Re-armed / waiting")
 
