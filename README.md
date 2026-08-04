@@ -1,47 +1,93 @@
 # PacketVision — Camera-Triggered OCR + Google Sheets Automation
 
-PacketVision watches a Raspberry Pi camera feed for the moment a packet or document lands in frame, captures a sharp full-resolution shot, deskews and crops the marked region, and runs it through Gemini OCR to pull an ID (an Amazon order ID or tracking number). That ID then drives an update to a Google Sheet — no manual entry required.
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue) ![Raspberry Pi](https://img.shields.io/badge/Platform-Raspberry%20Pi-C51A4A) ![Gemini](https://img.shields.io/badge/OCR-Gemini-4285F4) ![OpenCV](https://img.shields.io/badge/CV-OpenCV-5C3EE8) ![Status](https://img.shields.io/badge/Status-Production-brightgreen)
 
-It was built for warehouse and logistics stations, where a slow or unreliable capture pipeline turns into a bottleneck on the floor. A few things made that possible:
+A computer-vision + automation pipeline that watches a Raspberry Pi camera feed, detects when a packet or document is placed in frame, and turns that into a structured Google Sheets update — with no manual data entry.
 
-- Change detection on a region of interest, so the camera triggers itself
-- Auto-focus plus burst capture, so blur doesn't ruin a read
-- A red-marker deskew step that keeps OCR input consistent regardless of how the packet is placed
-- Rate limiting and retry logic that respect Gemini's quotas instead of hammering the API
-- A Google Sheets integration that behaves like a lightweight database for status updates
+This started as a warehouse logging fix and was rebuilt into a clean, production-grade pipeline: camera trigger → deskew crop → Gemini OCR → spreadsheet write, with quota protection and retry logic built in from the start rather than bolted on.
 
-## How it works
+## 📌 Project Summary
 
-The pipeline runs in six stages, from an idle camera to an updated spreadsheet row:
+Manual packet logging is slow and error-prone — someone has to read a label, find the right row, and type the ID in by hand, over and over. PacketVision replaces that with a camera that watches for a packet, captures a sharp image the moment one appears, reads the ID with Gemini OCR, and writes the result straight into the sheet that tracks it.
 
-**1. Watch, don't scan.** A low-resolution preview stream monitors a user-defined region of interest. Nothing expensive happens until something changes there.
+It's built for real-world conditions on a warehouse or logistics station, where lighting varies, packets land at odd angles, and the pipeline can't afford to be babysat.
 
-**2. Detect and wait.** Once the ROI changes — a packet has been placed — a short, configurable countdown gives the scene time to settle.
+## ✨ Key Features
 
-**3. Focus once, shoot several.** The camera triggers autofocus a single time, then captures a burst of frames. The sharpest one, picked automatically, moves forward.
+✅ Hands-free trigger via region-of-interest change detection
+✅ Auto-focus-once + burst capture, with sharpest-frame selection
+✅ Red-marker deskew crop for consistent OCR input regardless of packet placement
+✅ Compressed, size-capped OCR payloads to control Gemini API cost
+✅ Rate limiting (RPM) and daily quota capping (RPD), persisted across restarts
+✅ Exponential backoff retry on 429 / quota errors
+✅ Google Sheets integration with rule-based row updates
+✅ OpenCV overlay or CustomTkinter UI for live operator feedback
 
-**4. Crop to the marker.** The system finds the largest red contour in the frame, computes its bounding rectangle, and warps that region out of the original full-resolution image. Any empty space left by the warp is filled with green so it doesn't get mistaken for content.
+## 🧠 Pipeline Architecture
 
-**5. Read it with Gemini.** The cropped image is resized and compressed to stay under a byte limit, then sent to Gemini with a structured prompt that asks for a JSON result — not free text to parse.
+| Stage | What happens |
+|---|---|
+| Trigger | Low-res preview stream monitors a user-defined ROI |
+| Detect | ROI change starts a short, configurable countdown |
+| Capture | Single autofocus pass + burst capture, sharpest frame selected via Laplacian scoring |
+| Crop | Largest red contour located, `minAreaRect` computed, region warped from the full-res original |
+| OCR | Image resized and JPEG-compressed under a byte limit, sent to Gemini with a structured JSON prompt |
+| Write | Extracted ID matched against Column A, row updated per business rules |
+| Feedback | Live overlay UI shows capture and result to the operator |
 
-**6. Write it back.** The extracted ID is matched against Column A in the target sheet, and the row is updated according to a small set of business rules (for instance, only touching a row if its status is still "receipt").
+## 🔄 Workflow
 
-A UI layer sits on top of all this — either an OpenCV overlay or a CustomTkinter window, depending on the build — so an operator can see what the camera sees and confirm a read if needed.
+1. **Watch** — a low-resolution preview stream monitors the ROI, so nothing expensive runs until something changes.
+2. **Detect** — a packet enters frame, a short countdown gives the scene time to settle.
+3. **Capture** — autofocus triggers once, a burst of frames is captured, and the sharpest one moves forward.
+4. **Crop** — the largest red-marker contour is found and warped out of the full-resolution image; empty warp space is filled green.
+5. **Read** — the cropped image is compressed and sent to Gemini, which returns a structured JSON result.
+6. **Write** — the ID is matched in the sheet and the row is updated according to its current status.
 
-## What makes it reliable in practice
+## 📊 Reliability Notes
 
-**Capture.** A low-res preview handles ROI detection cheaply, while full-resolution bursts with Laplacian-based sharpness scoring make sure the frame that actually gets processed is in focus. Exposure and white balance can be locked after a reference capture, and autofocus runs once rather than continuously, so it doesn't hunt mid-shot.
+**Capture.** Lores preview keeps ROI detection cheap; full-res burst capture with sharpness scoring keeps the final frame in focus. AE/AWB can lock after a reference shot, and AF fires once rather than hunting mid-capture.
 
-**Cropping.** The red-marker workflow computes a fast mask on a downscaled copy, locates the largest contour, and only then warps the corresponding region out of the full-resolution original — so cropping is fast without sacrificing image quality. A trimming step cleans up the green border left behind by the warp.
+**OCR cost control.** Every payload is downscaled by max dimension and pixel count, then compressed to stay under 900KB by default — keeping both latency and API cost predictable.
 
-**OCR cost control.** Every image sent to Gemini is downscaled by both maximum dimension and pixel count, then JPEG-compressed to a target size (under 900KB by default). The exact bytes sent can optionally be saved locally, which makes debugging a bad read straightforward.
+**Quota protection.** A cooldown enforces requests-per-minute, a persisted state file (`ocr_rate_state.json`) enforces a daily cap, and exponential backoff absorbs 429s automatically — so a burst of activity degrades gracefully instead of taking the pipeline down.
 
-**Quota protection.** A cooldown enforces a request-per-minute limit, a persisted state file (`ocr_rate_state.json`) enforces a daily cap, and exponential backoff kicks in automatically on 429 or quota errors — so a burst of activity degrades gracefully instead of taking the pipeline down.
+**Sheet logic.** IDs are matched in Column A; rows already marked `done` are skipped, rows marked `receipt` are updated across the relevant columns, and unmatched IDs optionally prompt for confirmation before a new row is added.
 
-**Sheet updates.** IDs are matched in Column A, with rules like: skip rows already marked done, update the relevant columns when a row is in "receipt" status, and prompt for confirmation before adding a row for an ID that isn't found at all.
+## 🛠️ Technologies Used
 
-## Requirements
+| Tool | Purpose |
+|---|---|
+| Python | Core language |
+| Picamera2 | Raspberry Pi camera control |
+| OpenCV | Image processing, red-mask detection, deskew/crop |
+| Gemini API | OCR extraction |
+| Google Sheets API | Data write-back |
+| NumPy | Numerical operations |
 
-**Hardware:** a Raspberry Pi with a camera supported by Picamera2. Consistent lighting matters more than raw resolution for OCR accuracy.
+## 🚀 Requirements
+
+**Hardware:** a Raspberry Pi with a Picamera2-supported camera. Consistent lighting matters more than raw resolution for OCR accuracy.
 
 **Software:** Python 3.9+, a working Picamera2 install, a Google service account credentials file, and a Gemini API key.
+
+## 🔮 Future Improvements
+
+- [ ] Web dashboard for live monitoring across multiple stations
+- [ ] Configurable business-rule engine instead of hardcoded sheet logic
+- [ ] Docker packaging for faster deployment to new Pi units
+- [ ] Automated regression testing on captured sample images
+- [ ] Support for multiple ROI zones on a single camera
+
+## 💼 Portfolio Value
+
+This project demonstrates practical experience with real-time computer vision on constrained hardware, LLM-based OCR integration with production-grade guardrails (rate limiting, retries, cost control), and end-to-end automation from camera trigger to business-system update.
+
+## 👨‍💻 Author
+
+**Hesam Fathollahi**
+Senior Software Engineer — AI & Computer Vision
+
+## 📄 License
+
+This project is available under the MIT License.
